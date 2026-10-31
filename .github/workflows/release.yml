@@ -1,0 +1,117 @@
+name: Build and release kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to build
+        required: true
+        default: lineage-23.2-gha
+      revision:
+        description: Release revision (r1, r2, ...)
+        required: true
+        default: r1
+      lineage_date:
+        description: LineageOS build date for stock boot.img (YYYYMMDD, empty = latest)
+        required: false
+        default: ""
+      prerelease:
+        description: Mark as pre-release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  DEVICE: beyond2lte
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 50
+
+      - name: Build docker image
+        run: docker build -t exynos9820-kbuild -f Dockerfile.build .
+
+      - name: Version info
+        id: ver
+        run: |
+          KVER=$(make -s kernelversion | sed 's/-.*//')
+          LOS=$(echo "${{ inputs.branch }}" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+          TAG="v${KVER}-ds-${{ inputs.revision }}"
+          {
+            echo "kver=$KVER"
+            echo "los=$LOS"
+            echo "tag=$TAG"
+            echo "title=${KVER}-droidspaces-${{ inputs.revision }} (LineageOS ${LOS}, ${DEVICE})"
+            echo "asset=boot-${TAG}-${DEVICE}.img"
+            echo "sha=$(git rev-parse --short=9 HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG already exists, bump the revision"; exit 1
+          fi
+
+      - name: Download stock boot.img
+        id: stock
+        run: |
+          curl -sf "https://download.lineageos.org/api/v2/devices/${DEVICE}/builds" -o builds.json
+          python3 - "${{ steps.ver.outputs.los }}" "${{ inputs.lineage_date }}" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+          los, date = sys.argv[1], sys.argv[2]
+          builds = [b for b in json.load(open("builds.json")) if b["version"] == los]
+          if date:
+              builds = [b for b in builds if b["date"].replace("-", "") == date]
+          if not builds:
+              sys.exit(f"no LineageOS {los} build found for date '{date}'")
+          b = builds[0]
+          f = next(f for f in b["files"] if f["filename"] == "boot.img")
+          print(f"url={f['url']}\nsha256={f['sha256']}\ndate={b['date']}")
+          PY
+          curl -sfL "$(grep '^url=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)" -o stock-boot.img
+          echo "$(grep '^sha256=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)  stock-boot.img" | sha256sum -c -
+
+      - name: Build kernel
+        run: docker run --rm -v "$PWD":/src -w /src exynos9820-kbuild ./build.sh Image
+
+      - name: Make boot image
+        run: |
+          docker run --rm -v "$PWD":/src -w /src exynos9820-kbuild \
+            ./mkboot.sh stock-boot.img "${{ steps.ver.outputs.asset }}"
+          sudo chown "$(id -u)" "${{ steps.ver.outputs.asset }}"
+          sha256sum "${{ steps.ver.outputs.asset }}" > "${{ steps.ver.outputs.asset }}.sha256"
+
+      - name: Release notes
+        env:
+          TITLE: ${{ steps.ver.outputs.title }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          ASSET: ${{ steps.ver.outputs.asset }}
+          LOS: ${{ steps.ver.outputs.los }}
+          BRANCH: ${{ inputs.branch }}
+          SHA: ${{ steps.ver.outputs.sha }}
+          STOCK_DATE: ${{ steps.stock.outputs.date }}
+          REPO: ${{ github.repository }}
+        run: |
+          git fetch -q --depth=50 https://github.com/LineageOS/android_kernel_samsung_exynos9820 "lineage-${LOS}"
+          BASE=$(git merge-base HEAD FETCH_HEAD || git rev-parse FETCH_HEAD)
+          export BASE=${BASE:0:9}
+          export SHA256=$(cut -d' ' -f1 "$ASSET.sha256")
+          export CLANG=$(docker run --rm exynos9820-kbuild clang --version | head -1)
+          envsubst < .github/release-notes.md > notes.md
+          cat notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "${{ steps.ver.outputs.asset }}" "${{ steps.ver.outputs.asset }}.sha256" \
+            --target "$(git rev-parse HEAD)" \
+            --title "${{ steps.ver.outputs.title }}" \
+            --notes-file notes.md \
+            ${{ inputs.prerelease && '--prerelease' || '' }}
