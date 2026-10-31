@@ -1,0 +1,8 @@
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git bc bison flex libssl-dev libelf-dev cpio python3 python-is-python3 make gcc g++ \
+    build-essential kmod zip unzip curl wget rsync lz4 device-tree-compiler \
+    libncurses-dev ca-certificates clang lld llvm \
+    gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
